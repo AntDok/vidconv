@@ -1,0 +1,94 @@
+# vidconv configuration
+#
+# Looked up in this order: ./vidconv.toml, the dir holding the vidconv script,
+# then $XDG_CONFIG_HOME/vidconv/config.toml. Override with --config.
+# Relative paths below resolve against the directory holding THIS file.
+
+default_profile = "x265"
+
+[paths]
+# Where to look for files to convert.
+source_dir = "./convert"
+
+# Where converted files land.
+output_dir = "./converted"
+
+# Path components to drop when mirroring the source tree into output_dir.
+# With source_dir/Show/Season 1/unconverted/ep.mkv this writes
+# output_dir/Show/Season 1/ep.mkv -- i.e. what the old convert.sh did with "../".
+strip_dirs = ["unconverted"]
+
+# Set true to dump every output directly in output_dir with no subdirectories.
+flatten = false
+
+[scan]
+# Glob patterns matched against both the filename and the path relative to
+# source_dir. A file must match at least one include and no excludes.
+include = ["*.mkv"]
+exclude = []
+
+# Minimum path depth below source_dir, counted in components including the
+# filename. 0 accepts everything; 2 requires at least one subdirectory.
+min_depth = 0
+
+[ffmpeg]
+# Passed to nice(1). Omit or set to 0 for normal priority.
+nice = 10
+
+# false => -n (never clobber an existing output; safe to re-run).
+# true  => -y (overwrite). `convert --redo` is usually what you want instead.
+overwrite = false
+
+[delete]
+# What to do with a source file after its output verifies.
+#   "ask"   - prompt before deleting (default)
+#   "auto"  - delete without prompting, but still only after verification
+#   "never" - keep sources; `vidconv clean` can remove them later
+# Override per-run with `convert --delete auto`.
+policy = "ask"
+
+# How hard to check an output before allowing its source to be deleted.
+#   "decode" - full decode of the output; catches truncation and corruption.
+#              Costs roughly the decode time of the file. This is the only mode
+#              that would have caught the failures the old remove.sh ignored.
+#   "probe"  - ffprobe reads it and the duration matches the source. Fast.
+#   "none"   - no check on convert. `clean` still falls back to "probe",
+#              because deleting on no evidence at all is how you lose files.
+verify = "decode"
+
+
+# --- profiles ---------------------------------------------------------------
+# `args` sits between the input and the output on the ffmpeg command line:
+#   ffmpeg -n -i <source> <args> <output>
+# `suffix` is appended to the filename stem; `extension` sets the container.
+
+# Matches the old convert.sh exactly: -map 0 -vcodec libx265 -crf 24
+# x265 logs its own banner and stats straight to stderr and ignores ffmpeg's
+# -loglevel, so log-level=error is what actually quiets it.
+[profiles.x265]
+args = "-map 0 -c:v libx265 -crf 24 -x265-params log-level=error -c:a copy -c:s copy"
+extension = ".mkv"
+
+# Smaller files, slower encode. Good for archival.
+[profiles.x265-slow]
+args = """-map 0 -c:v libx265 -crf 22 -preset slow -x265-params log-level=error \
+-c:a copy -c:s copy"""
+extension = ".mkv"
+
+# NVIDIA hardware encode. Much faster, larger output at similar visual quality.
+[profiles.nvenc]
+args = "-map 0 -c:v hevc_nvenc -preset p5 -rc vbr -cq 26 -c:a copy -c:s copy"
+extension = ".mkv"
+
+# Intel/AMD hardware encode via VAAPI. Needs a working /dev/dri render node.
+# Subtitles are dropped: the hwupload filter cannot carry them through.
+[profiles.vaapi]
+args = """-vaapi_device /dev/dri/renderD128 -vf format=nv12,hwupload \
+-c:v hevc_vaapi -qp 26 -c:a copy"""
+extension = ".mkv"
+
+# Remux only: no re-encode. Useful for testing the pipeline end to end in
+# seconds, since it just copies streams into a new container.
+[profiles.copy]
+args = "-map 0 -c copy"
+extension = ".mkv"

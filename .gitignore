@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Media working directories — never commit video
+/convert/
+/converted/
+*.mkv
+*.mp4
+*.avi
+*.mov
+*.m4v
+*.ts
+
+# Local config overrides
+vidconv.local.toml

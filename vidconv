@@ -1,0 +1,628 @@
+#!/usr/bin/env python3
+"""vidconv - batch video transcoding on top of ffmpeg.
+
+Stdlib only. Requires python 3.11+ (tomllib) and ffmpeg/ffprobe on PATH.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import dataclasses
+import fnmatch
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+CONFIG_NAME = "vidconv.toml"
+DELETE_POLICIES = ("ask", "auto", "never")
+VERIFY_MODES = ("decode", "probe", "none")
+
+# Durations may legitimately differ by a hair after a container/codec change.
+DURATION_TOLERANCE_S = 1.0
+
+
+class ConfigError(Exception):
+    pass
+
+
+@dataclasses.dataclass
+class Profile:
+    name: str
+    args: list[str]
+    extension: str = ".mkv"
+    suffix: str = ""
+
+
+@dataclasses.dataclass
+class Config:
+    source_dir: Path
+    output_dir: Path
+    strip_dirs: list[str]
+    flatten: bool
+    include: list[str]
+    exclude: list[str]
+    min_depth: int
+    default_profile: str
+    profiles: dict[str, Profile]
+    delete_policy: str
+    verify: str
+    nice: int | None
+    overwrite: bool
+
+
+def find_config(explicit: str | None) -> Path:
+    if explicit:
+        p = Path(explicit).expanduser()
+        if not p.is_file():
+            raise ConfigError(f"config not found: {p}")
+        return p
+    candidates = [
+        Path.cwd() / CONFIG_NAME,
+        Path(__file__).resolve().parent / CONFIG_NAME,
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        / "vidconv"
+        / "config.toml",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    raise ConfigError(
+        "no config file found. Looked in:\n  "
+        + "\n  ".join(str(c) for c in candidates)
+        + f"\nWrite one, or point at it with --config. See the bundled {CONFIG_NAME}."
+    )
+
+
+def load_config(path: Path) -> Config:
+    with path.open("rb") as fh:
+        raw = tomllib.load(fh)
+
+    base = path.parent
+
+    def resolve(value: str) -> Path:
+        p = Path(value).expanduser()
+        return p if p.is_absolute() else (base / p).resolve()
+
+    paths = raw.get("paths", {})
+    if "source_dir" not in paths or "output_dir" not in paths:
+        raise ConfigError("[paths] must define both source_dir and output_dir")
+
+    profiles: dict[str, Profile] = {}
+    for name, body in raw.get("profiles", {}).items():
+        if "args" not in body:
+            raise ConfigError(f"profile '{name}' is missing an 'args' string")
+        profiles[name] = Profile(
+            name=name,
+            args=shlex.split(body["args"]),
+            extension=body.get("extension", ".mkv"),
+            suffix=body.get("suffix", ""),
+        )
+    if not profiles:
+        raise ConfigError("no [profiles.*] defined")
+
+    default_profile = raw.get("default_profile") or next(iter(profiles))
+    if default_profile not in profiles:
+        raise ConfigError(f"default_profile '{default_profile}' is not a defined profile")
+
+    scan = raw.get("scan", {})
+    delete = raw.get("delete", {})
+
+    policy = delete.get("policy", "ask")
+    if policy not in DELETE_POLICIES:
+        raise ConfigError(f"delete.policy must be one of {DELETE_POLICIES}, got '{policy}'")
+
+    verify = delete.get("verify", "decode")
+    if verify not in VERIFY_MODES:
+        raise ConfigError(f"delete.verify must be one of {VERIFY_MODES}, got '{verify}'")
+
+    ffmpeg = raw.get("ffmpeg", {})
+
+    return Config(
+        source_dir=resolve(paths["source_dir"]),
+        output_dir=resolve(paths["output_dir"]),
+        strip_dirs=paths.get("strip_dirs", []),
+        flatten=paths.get("flatten", False),
+        include=scan.get("include", ["*.mkv"]),
+        exclude=scan.get("exclude", []),
+        min_depth=scan.get("min_depth", 0),
+        default_profile=default_profile,
+        profiles=profiles,
+        delete_policy=policy,
+        verify=verify,
+        nice=ffmpeg.get("nice"),
+        overwrite=ffmpeg.get("overwrite", False),
+    )
+
+
+def output_path_for(src: Path, cfg: Config, profile: Profile) -> Path:
+    rel = src.relative_to(cfg.source_dir)
+    if cfg.flatten:
+        parts: tuple[str, ...] = ()
+    else:
+        parts = tuple(p for p in rel.parts[:-1] if p not in cfg.strip_dirs)
+    stem = rel.stem + profile.suffix
+    return cfg.output_dir.joinpath(*parts, stem + profile.extension)
+
+
+def scan(cfg: Config) -> list[Path]:
+    if not cfg.source_dir.is_dir():
+        raise ConfigError(f"source_dir does not exist: {cfg.source_dir}")
+
+    found: list[Path] = []
+    for path in sorted(cfg.source_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(cfg.source_dir)
+        if len(rel.parts) < cfg.min_depth:
+            continue
+        rel_str = str(rel)
+        if not any(fnmatch.fnmatch(rel_str, pat) or fnmatch.fnmatch(path.name, pat)
+                   for pat in cfg.include):
+            continue
+        if any(fnmatch.fnmatch(rel_str, pat) or fnmatch.fnmatch(path.name, pat)
+               for pat in cfg.exclude):
+            continue
+        found.append(path)
+    return found
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if abs(n) < 1024:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}P"
+
+
+def probe_duration(path: Path) -> float | None:
+    """Container duration in seconds, or None if ffprobe can't determine it."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        return float(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def decode_duration(path: Path) -> tuple[float | None, str]:
+    """Fully decode path and report how far the decode actually got.
+
+    The declared container duration is not trustworthy for this: Matroska keeps
+    duration in the segment header, so a file truncated to half its length still
+    *claims* full duration, and ffmpeg treats the early EOF as a clean end of
+    stream rather than an error. Only the decoded timestamp reveals the loss.
+    """
+    proc = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path),
+         "-f", "null", "-progress", "pipe:1", "-nostats", "-"],
+        capture_output=True, text=True,
+    )
+    last: float | None = None
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key == "out_time_us" and value.strip().lstrip("-").isdigit():
+            last = int(value) / 1_000_000
+
+    if proc.returncode != 0:
+        detail = proc.stderr.strip().splitlines()
+        return last, detail[0] if detail else f"ffmpeg exit {proc.returncode}"
+    return last, ""
+
+
+def verify_output(src: Path, dst: Path, mode: str) -> tuple[bool, str]:
+    """Check dst is a plausible, intact transcode of src."""
+    if mode == "none":
+        return True, "verification disabled"
+
+    if not dst.is_file():
+        return False, "output missing"
+    if dst.stat().st_size == 0:
+        return False, "output is empty"
+
+    src_dur = probe_duration(src)
+    dst_dur = probe_duration(dst)
+    if dst_dur is None:
+        return False, "output unreadable by ffprobe"
+    if src_dur is not None and abs(src_dur - dst_dur) > DURATION_TOLERANCE_S:
+        return False, f"duration mismatch (source {src_dur:.1f}s, output {dst_dur:.1f}s)"
+
+    if mode == "probe":
+        return True, f"probe ok ({dst_dur:.0f}s)"
+
+    decoded, err = decode_duration(dst)
+    if err:
+        return False, f"decode failed: {err}"
+    if decoded is None:
+        return False, "decode produced no timestamps"
+
+    # Compare against the source, falling back to the output's own claim.
+    expected = src_dur if src_dur is not None else dst_dur
+    if expected - decoded > DURATION_TOLERANCE_S:
+        return False, (f"output is short: decoded {decoded:.1f}s "
+                       f"of an expected {expected:.1f}s (truncated or corrupt)")
+    return True, f"decode ok ({decoded:.0f}s)"
+
+
+def build_command(src: Path, dst: Path, profile: Profile, cfg: Config) -> list[str]:
+    cmd: list[str] = []
+    if cfg.nice is not None:
+        cmd += ["nice", "-n", str(cfg.nice)]
+    cmd += ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats"]
+    cmd += ["-y" if cfg.overwrite else "-n"]
+    cmd += ["-i", str(src)]
+    cmd += profile.args
+    cmd += [str(dst)]
+    return cmd
+
+
+def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config) -> bool:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = build_command(src, dst, profile, cfg)
+    print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
+    print(f"  {shlex.join(cmd)}")
+
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        print(f"  \033[31mffmpeg failed (exit {proc.returncode})\033[0m")
+        # A partial file is worse than none: it looks like a valid output to the
+        # next run and to `clean`.
+        if dst.is_file():
+            dst.unlink()
+            print("  removed partial output")
+        return False
+
+    ok, why = verify_output(src, dst, cfg.verify)
+    if not ok:
+        print(f"  \033[31mverification failed: {why}\033[0m")
+        return False
+
+    src_sz, dst_sz = src.stat().st_size, dst.stat().st_size
+    pct = (1 - dst_sz / src_sz) * 100 if src_sz else 0
+    delta = f"saved {pct:.0f}%" if pct >= 0 else f"\033[33mgrew {-pct:.0f}%\033[0m"
+    print(f"  \033[32mok\033[0m  {human_size(src_sz)} → {human_size(dst_sz)} "
+          f"({delta})  [{why}]")
+    return True
+
+
+def confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def maybe_delete(src: Path, dst: Path, cfg: Config, policy: str) -> None:
+    """Delete src, but only ever after its output has been verified."""
+    if policy == "never":
+        return
+
+    ok, why = verify_output(src, dst, cfg.verify if cfg.verify != "none" else "probe")
+    if not ok:
+        print(f"  \033[33mkeeping source: {why}\033[0m")
+        return
+
+    if policy == "ask" and not confirm(f"  delete source {src.name}?"):
+        print("  kept source")
+        return
+
+    src.unlink()
+    print(f"  \033[2mdeleted source {src.name}\033[0m")
+
+
+# --- curses picker ----------------------------------------------------------
+
+
+def pick(items: list[Path], cfg: Config, profile_names: list[str],
+         profile: str) -> tuple[list[Path], str] | None:
+    """Multi-select TUI. Returns (selected, profile) or None if cancelled."""
+    state = {"profile": profile}
+    selected = set(range(len(items)))
+    cursor = 0
+    top = 0
+
+    def put(stdscr: "curses._CursesWindow", y: int, text: str, w: int, attr: int) -> None:
+        # Writing to the bottom-right cell wraps the cursor off the screen and
+        # raises; keeping every line one short of the width avoids it entirely.
+        try:
+            stdscr.addnstr(y, 0, text.ljust(w - 1)[: w - 1], w - 1, attr)
+        except curses.error:
+            pass
+
+    def draw(stdscr: "curses._CursesWindow") -> None:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        if h < 3 or w < 20:
+            put(stdscr, 0, "terminal too small", w, curses.A_NORMAL)
+            stdscr.refresh()
+            return
+        body = max(1, h - 2)
+
+        header = (f" vidconv — {len(selected)}/{len(items)} selected"
+                  f" — profile: {state['profile']} ")
+        put(stdscr, 0, header, w, curses.A_REVERSE)
+
+        for row in range(body):
+            idx = top + row
+            if idx >= len(items):
+                break
+            mark = "[x]" if idx in selected else "[ ]"
+            rel = str(items[idx].relative_to(cfg.source_dir))
+            size = human_size(items[idx].stat().st_size)
+            left = f" {mark} {rel}"
+            pad = max(1, w - 2 - len(size) - len(left))
+            attr = curses.A_REVERSE if idx == cursor else curses.A_NORMAL
+            put(stdscr, row + 1, f"{left}{' ' * pad}{size}", w, attr)
+
+        help_line = " space toggle · a all · n none · i invert · p profile · enter run · q quit "
+        put(stdscr, h - 1, help_line, w, curses.A_REVERSE)
+        stdscr.refresh()
+
+    def loop(stdscr: "curses._CursesWindow") -> tuple[list[Path], str] | None:
+        nonlocal cursor, top
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        while True:
+            h, _ = stdscr.getmaxyx()
+            body = max(1, h - 2)
+            if cursor < top:
+                top = cursor
+            elif cursor >= top + body:
+                top = cursor - body + 1
+
+            draw(stdscr)
+            key = stdscr.getch()
+
+            if key in (ord("q"), 27):
+                return None
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cursor = min(cursor + 1, len(items) - 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                cursor = max(cursor - 1, 0)
+            elif key == curses.KEY_NPAGE:
+                cursor = min(cursor + body, len(items) - 1)
+            elif key == curses.KEY_PPAGE:
+                cursor = max(cursor - body, 0)
+            elif key in (curses.KEY_HOME, ord("g")):
+                cursor = 0
+            elif key in (curses.KEY_END, ord("G")):
+                cursor = len(items) - 1
+            elif key == ord(" "):
+                selected.symmetric_difference_update({cursor})
+                cursor = min(cursor + 1, len(items) - 1)
+            elif key == ord("a"):
+                selected.update(range(len(items)))
+            elif key == ord("n"):
+                selected.clear()
+            elif key == ord("i"):
+                selected.symmetric_difference_update(range(len(items)))
+            elif key == ord("p"):
+                i = profile_names.index(state["profile"])
+                state["profile"] = profile_names[(i + 1) % len(profile_names)]
+            elif key in (curses.KEY_ENTER, 10, 13):
+                return [items[i] for i in sorted(selected)], state["profile"]
+
+    if not items:
+        return None
+    return curses.wrapper(loop)
+
+
+# --- commands ---------------------------------------------------------------
+
+
+def resolve_targets(cfg: Config, profile: Profile, args: argparse.Namespace) -> list[Path]:
+    files = scan(cfg)
+
+    if args.match:
+        rx = re.compile(args.match)
+        files = [f for f in files if rx.search(str(f.relative_to(cfg.source_dir)))]
+
+    if not args.redo:
+        files = [f for f in files if not output_path_for(f, cfg, profile).exists()]
+
+    return files
+
+
+def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
+    profile = cfg.profiles[args.profile or cfg.default_profile]
+    files = scan(cfg)
+    if not files:
+        print(f"no matching files under {cfg.source_dir}")
+        return 0
+
+    total = 0
+    for f in files:
+        dst = output_path_for(f, cfg, profile)
+        status = "\033[2mdone\033[0m" if dst.exists() else "todo"
+        size = f.stat().st_size
+        total += size
+        print(f"{status:<14} {human_size(size):>8}  {f.relative_to(cfg.source_dir)}")
+        print(f"{'':<14} {'→':>8}  {dst}")
+
+    print(f"\n{len(files)} file(s), {human_size(total)} under {cfg.source_dir}")
+    return 0
+
+
+def cmd_convert(cfg: Config, args: argparse.Namespace) -> int:
+    profile_name = args.profile or cfg.default_profile
+    profile = cfg.profiles[profile_name]
+    files = resolve_targets(cfg, profile, args)
+
+    if not files:
+        print("nothing to convert")
+        return 0
+
+    if args.select:
+        if not sys.stdin.isatty():
+            print("--select needs a terminal", file=sys.stderr)
+            return 2
+        result = pick(files, cfg, sorted(cfg.profiles), profile_name)
+        if result is None:
+            print("cancelled")
+            return 1
+        files, profile_name = result
+        profile = cfg.profiles[profile_name]
+        if not files:
+            print("nothing selected")
+            return 0
+
+    policy = args.delete or cfg.delete_policy
+
+    if args.dry_run:
+        for f in files:
+            dst = output_path_for(f, cfg, profile)
+            print(shlex.join(build_command(f, dst, profile, cfg)))
+        print(f"\n{len(files)} file(s), profile '{profile.name}', "
+              f"delete policy '{policy}' — dry run, nothing done", file=sys.stderr)
+        return 0
+
+    print(f"{len(files)} file(s), profile '{profile.name}', delete policy '{policy}'")
+
+    converted, failed = [], []
+    for f in files:
+        dst = output_path_for(f, cfg, profile)
+        if convert_one(f, dst, profile, cfg):
+            converted.append(f)
+            maybe_delete(f, dst, cfg, policy)
+        else:
+            failed.append(f)
+
+    print(f"\n\033[1m{len(converted)} converted, {len(failed)} failed\033[0m")
+    for f in failed:
+        print(f"  \033[31mfailed\033[0m {f.relative_to(cfg.source_dir)}")
+    return 1 if failed else 0
+
+
+def cmd_clean(cfg: Config, args: argparse.Namespace) -> int:
+    """Delete sources whose outputs exist and verify."""
+    profile = cfg.profiles[args.profile or cfg.default_profile]
+    files = scan(cfg)
+    if args.match:
+        rx = re.compile(args.match)
+        files = [f for f in files if rx.search(str(f.relative_to(cfg.source_dir)))]
+
+    policy = args.delete or cfg.delete_policy
+    if policy == "never":
+        policy = "ask"
+
+    removable, blocked = [], []
+    print(f"verifying {len(files)} source(s) against {cfg.output_dir} "
+          f"(mode: {cfg.verify})...")
+    for f in files:
+        dst = output_path_for(f, cfg, profile)
+        ok, why = verify_output(f, dst, cfg.verify if cfg.verify != "none" else "probe")
+        (removable if ok else blocked).append((f, dst, why))
+
+    for f, _, why in blocked:
+        print(f"  \033[33mkeep\033[0m {f.relative_to(cfg.source_dir)} — {why}")
+
+    if not removable:
+        print("\nnothing safe to delete")
+        return 0
+
+    reclaimed = sum(f.stat().st_size for f, _, _ in removable)
+    print(f"\n{len(removable)} source(s) verified, {human_size(reclaimed)} to reclaim:")
+    for f, _, _ in removable:
+        print(f"  {f.relative_to(cfg.source_dir)}")
+
+    if args.dry_run:
+        print("\ndry run, nothing deleted", file=sys.stderr)
+        return 0
+
+    if policy == "ask" and not confirm(f"\ndelete {len(removable)} source file(s)?"):
+        print("nothing deleted")
+        return 0
+
+    for f, _, _ in removable:
+        f.unlink()
+    print(f"deleted {len(removable)} file(s), reclaimed {human_size(reclaimed)}")
+    return 0
+
+
+def cmd_profiles(cfg: Config, args: argparse.Namespace) -> int:
+    for name, p in sorted(cfg.profiles.items()):
+        tag = " (default)" if name == cfg.default_profile else ""
+        print(f"\033[1m{name}\033[0m{tag}")
+        print(f"  args:      {shlex.join(p.args)}")
+        print(f"  output:    {p.suffix}{p.extension}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="vidconv",
+        description="Batch video transcoding on top of ffmpeg.",
+    )
+    ap.add_argument("-c", "--config", help=f"path to {CONFIG_NAME}")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    def common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("-p", "--profile", help="encode profile to use")
+        p.add_argument("-m", "--match", help="only files whose path matches this regex")
+
+    p_list = sub.add_parser("list", help="show source files and their output paths")
+    common(p_list)
+    p_list.set_defaults(func=cmd_list)
+
+    p_conv = sub.add_parser("convert", help="transcode source files")
+    common(p_conv)
+    p_conv.add_argument("-s", "--select", action="store_true",
+                        help="pick files interactively in a TUI")
+    p_conv.add_argument("-d", "--delete", choices=DELETE_POLICIES,
+                        help="override delete.policy for this run")
+    p_conv.add_argument("--redo", action="store_true",
+                        help="re-convert files whose output already exists")
+    p_conv.add_argument("-N", "--dry-run", action="store_true",
+                        help="print the ffmpeg commands and exit")
+    p_conv.set_defaults(func=cmd_convert)
+
+    p_clean = sub.add_parser("clean", help="delete sources with verified outputs")
+    common(p_clean)
+    p_clean.add_argument("-d", "--delete", choices=DELETE_POLICIES,
+                         help="override delete.policy for this run")
+    p_clean.add_argument("-N", "--dry-run", action="store_true",
+                         help="report what would be deleted and exit")
+    p_clean.set_defaults(func=cmd_clean)
+
+    p_prof = sub.add_parser("profiles", help="list configured encode profiles")
+    p_prof.set_defaults(func=cmd_profiles)
+
+    args = ap.parse_args()
+
+    for tool in ("ffmpeg", "ffprobe"):
+        if not shutil.which(tool):
+            print(f"vidconv: {tool} not found on PATH", file=sys.stderr)
+            return 2
+
+    try:
+        cfg = load_config(find_config(args.config))
+        if getattr(args, "profile", None) and args.profile not in cfg.profiles:
+            print(f"vidconv: unknown profile '{args.profile}'. "
+                  f"Known: {', '.join(sorted(cfg.profiles))}", file=sys.stderr)
+            return 2
+        return args.func(cfg, args)
+    except ConfigError as e:
+        print(f"vidconv: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
