@@ -58,7 +58,7 @@ class Config:
     verify_convert: str
     verify_delete: str
     nice: int | None
-    overwrite: bool
+    overwrite_outputs: bool
 
 
 def find_config(explicit: str | None) -> Path:
@@ -149,6 +149,14 @@ def load_config(path: Path) -> Config:
 
     ffmpeg = raw.get("ffmpeg", {})
 
+    # Renamed from "overwrite", which read as though it overwrote the source. Fail
+    # loudly rather than defaulting a stale key to false: someone who set it to true
+    # would otherwise get the opposite of what their config says, silently.
+    if "overwrite" in ffmpeg:
+        raise ConfigError(
+            "[ffmpeg] overwrite has been renamed to overwrite_outputs "
+            "(it controls clobbering files in output_dir; it never touches sources)")
+
     return Config(
         source_dir=source_dir,
         output_dir=output_dir,
@@ -162,7 +170,7 @@ def load_config(path: Path) -> Config:
         verify_convert=verify_convert,
         verify_delete=verify_delete,
         nice=ffmpeg.get("nice"),
-        overwrite=ffmpeg.get("overwrite", False),
+        overwrite_outputs=ffmpeg.get("overwrite_outputs", False),
     )
 
 
@@ -305,7 +313,8 @@ def build_command(src: Path, dst: Path, profile: Profile, cfg: Config,
     # -n makes ffmpeg decline to clobber an existing output -- and exit 0 while
     # doing it. Anything that means to re-encode must pass -y, or the encode is a
     # silent no-op that still looks like success.
-    cmd += ["-y" if (cfg.overwrite if overwrite is None else overwrite) else "-n"]
+    clobber = cfg.overwrite_outputs if overwrite is None else overwrite
+    cmd += ["-y" if clobber else "-n"]
     cmd += ["-i", str(src)]
     cmd += profile.args
     cmd += [str(dst)]
@@ -576,7 +585,7 @@ def cmd_convert(cfg: Config, args: argparse.Namespace) -> int:
             verify_mode = required
 
     # --redo means "encode this again", which is impossible under -n.
-    overwrite = cfg.overwrite or args.redo
+    overwrite = cfg.overwrite_outputs or args.redo
 
     if args.dry_run:
         for f in files:

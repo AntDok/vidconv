@@ -46,7 +46,7 @@ nice = 10
 #            the tool is safe to re-run.
 #   true  => -y. Re-encode over existing outputs every time.
 # `convert --redo` is the per-run override and is usually what you want.
-overwrite = false
+overwrite_outputs = false
 
 [convert]
 # Check run after each encode. This is the one that costs you wall-clock time.

@@ -120,7 +120,7 @@ quietly had an `unlink()` in it with no checks at all.
 ## ffmpeg exit 0 does not mean it did anything
 
 `--redo` used to be a **silent no-op that reported success**. With `-n` (the
-default, `overwrite = false`), ffmpeg sees the existing output, prints "already
+default, `overwrite_outputs = false`), ffmpeg sees the existing output, prints "already
 exists", and **exits 0**. So `convert_one` concluded success, verified the *stale*
 output, passed, and reported "2 converted". With `--delete auto` it then deleted
 the source having re-encoded nothing.
@@ -164,6 +164,12 @@ Two fixes, keep both:
   Don't reintroduce it without reading that section.
 - **`-n` not `-y` by default.** Re-running is safe and idempotent; it skips
   finished work rather than redoing it. `--redo` is the explicit override.
+- **The config key is `overwrite_outputs`, not `overwrite`.** It was the latter,
+  and it reads as though it overwrites the *source* — it does not, and never did.
+  It is ffmpeg's `-y`/`-n`, which applies only to the file being written. The old
+  key now raises a `ConfigError` rather than being ignored: silently defaulting a
+  stale `overwrite = true` to `false` would give someone the opposite of what
+  their config plainly says.
 - **Deletion is a separate concern from conversion.** `convert --delete` and the
   standalone `clean` command share `verify_output()`. You can always convert now
   and delete later, which is what `policy = "never"` + `clean` is for.
