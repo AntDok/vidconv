@@ -177,25 +177,48 @@ Two fixes, keep both:
   between input and output. No abstraction over ffmpeg — you can paste any ffmpeg
   invocation you already trust into the config and it works.
 
-## How I tested it
+## Tests
 
-No test framework (no installs), so: generate real video with
-`ffmpeg -f lavfi -i testsrc + sine`, build a fake source tree including a filename
-with spaces, and exercise the real binary. Worth redoing after changes:
+`tests/test_vidconv.py`, stdlib `unittest` (no installs, so no pytest — don't add
+one). `python3 -m unittest discover -s tests -v`, about 6 seconds.
 
-- convert → check output is actually `hevc` via ffprobe, sources survive
-- re-run → must skip, not re-encode
-- sabotage outputs three ways (**truncate**, empty, delete) → `clean --dry-run`
-  must refuse all three
-- `--delete auto` → sources gone, outputs intact
-- `source_dir == output_dir`, and spelled as `./lib` vs `./lib/../lib` vs a symlink
-  → all must exit 2 with the source still on disk
-- `output_dir` nested inside `source_dir` → converts once, and the second run must
-  find nothing new (i.e. it did not rescan its own outputs as sources)
-- bogus encoder in a profile → exit 1, no partial file, source preserved
-- exit codes: 0 ok / 1 failure / 2 config error
-- TUI: drive it through a `pty.fork()` and feed keys, since a curses crash only
-  shows up at runtime. This is how the bottom-right-cell bug was found.
+It generates real video with `ffmpeg -f lavfi -i testsrc + sine` and runs the real
+script. **Not mocked, on purpose.** Every bug this tool has had lived in the seam
+between vidconv and ffmpeg — an ffmpeg that exits 0 having done nothing, an ffmpeg
+that refuses a job we then "clean up" — and a mock would have faithfully
+reproduced my wrong assumptions instead of catching them. Fixtures include
+filenames with spaces, which the shell scripts this replaced used to mangle.
+
+The `Safety` class is the point of the suite. Every test in it is a bug that
+reached a commit, and two of them destroyed a real file. If one starts failing
+during a refactor, the refactor is wrong.
+
+It earned its keep immediately: it caught a hole in the `source_dir == output_dir`
+guard *within minutes of being written* — see below.
+
+Still only tested by hand: the TUI (drive it through a `pty.fork()` and feed keys;
+a curses crash only shows up at runtime, which is how the bottom-right-cell bug
+was found).
+
+## resolve() must resolve absolute paths too
+
+The `source_dir == output_dir` check compares resolved paths, and `resolve()`
+originally did this:
+
+```python
+return p if p.is_absolute() else (base / p).resolve()   # WRONG
+```
+
+Relative paths got `.resolve()`; absolute ones were used verbatim. I "verified"
+the guard by hand with `./lib` vs `./lib/../lib` — both relative, both resolved,
+check passed, looked airtight. But an **absolute** `output_dir` that is a symlink
+to `source_dir`, or that contains `..`, compares unequal as a string and walks
+straight through. The guard was bypassable by spelling the directory a second way,
+which is precisely what it exists to stop.
+
+The tests caught this on their first run. Absolute paths are the normal case in a
+real config, and my by-hand testing had only ever used relative ones — that gap is
+the whole argument for the suite existing.
 
 ## Known gaps / if you extend this
 

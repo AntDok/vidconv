@@ -28,6 +28,17 @@ with `--config`.
 In the TUI: `space` toggle, `a` all, `n` none, `i` invert, `p` cycle profile,
 `enter` run, `q` cancel.
 
+## Tests
+
+```sh
+python3 -m unittest discover -s tests -v      # ~6s, needs ffmpeg on PATH
+python3 -m unittest tests.test_vidconv.Safety # just the destructive paths
+```
+
+Stdlib `unittest`, no install step. The tests generate real video with ffmpeg and
+run the real script; `Safety` covers the paths that can destroy a file, and every
+test in it is a bug that actually happened.
+
 ## Verification (and speed)
 
 There are two separate checks, because they have different jobs:
