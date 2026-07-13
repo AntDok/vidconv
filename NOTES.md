@@ -64,6 +64,42 @@ verification is deliberately paranoid and deliberately the slow path.
 the risk. `clean` refuses to drop below `probe` even if `verify = "none"`, because
 deleting on *zero* evidence is indefensible.
 
+## Two checks, not one (and never two decodes)
+
+Originally there was a single `verify` setting used both after each encode and
+again before deleting — which meant a `convert --delete auto` **decoded every
+output twice**. Measured: 4 decode passes for 2 files. Now:
+
+- `[convert] verify` (default `probe`) — the post-encode check. The one that
+  costs wall-clock time. Cheap by default.
+- `[delete] verify` (default `decode`) — required before a source is deleted.
+  Safety, not speed.
+
+`VERIFY_RANK` orders them, so a check already passed at a rank ≥ what deletion
+needs is trusted rather than re-run. And if a run deletes, `cmd_convert`
+escalates the post-encode check up to the deletion requirement. Net effect:
+**exactly one decode pass, and never zero when a source is about to die.**
+`--verify none --delete auto` still decodes. That escalation is the invariant to
+preserve if you touch this.
+
+## ffmpeg exit 0 does not mean it did anything
+
+`--redo` used to be a **silent no-op that reported success**. With `-n` (the
+default, `overwrite = false`), ffmpeg sees the existing output, prints "already
+exists", and **exits 0**. So `convert_one` concluded success, verified the *stale*
+output, passed, and reported "2 converted". With `--delete auto` it then deleted
+the source having re-encoded nothing.
+
+Two fixes, keep both:
+
+1. `--redo` now implies `-y`. Re-encoding is impossible under `-n`, so any code
+   path meaning to re-encode must force overwrite.
+2. `convert_one` checks the output's mtime advanced past the moment ffmpeg
+   started. This is the general guard: exit 0 with no new bytes written is
+   treated as failure regardless of cause. Don't remove it because the `-y` fix
+   "already handles it" — that fix covers the one case we found, this covers the
+   ones we didn't.
+
 ## Other gotchas hit during testing
 
 - **curses crashes on the bottom-right cell.** Writing a character to the last

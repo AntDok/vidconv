@@ -16,12 +16,17 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
 CONFIG_NAME = "vidconv.toml"
 DELETE_POLICIES = ("ask", "auto", "never")
-VERIFY_MODES = ("decode", "probe", "none")
+
+# Ordered weakest to strongest; a check already passed at a given rank satisfies
+# any requirement at or below it, which is what lets us skip redundant decodes.
+VERIFY_RANK = {"none": 0, "probe": 1, "decode": 2}
+VERIFY_MODES = tuple(VERIFY_RANK)
 
 # Durations may legitimately differ by a hair after a container/codec change.
 DURATION_TOLERANCE_S = 1.0
@@ -51,7 +56,8 @@ class Config:
     default_profile: str
     profiles: dict[str, Profile]
     delete_policy: str
-    verify: str
+    verify_convert: str
+    verify_delete: str
     nice: int | None
     overwrite: bool
 
@@ -117,9 +123,16 @@ def load_config(path: Path) -> Config:
     if policy not in DELETE_POLICIES:
         raise ConfigError(f"delete.policy must be one of {DELETE_POLICIES}, got '{policy}'")
 
-    verify = delete.get("verify", "decode")
-    if verify not in VERIFY_MODES:
-        raise ConfigError(f"delete.verify must be one of {VERIFY_MODES}, got '{verify}'")
+    verify_delete = delete.get("verify", "decode")
+    if verify_delete not in VERIFY_MODES:
+        raise ConfigError(
+            f"delete.verify must be one of {VERIFY_MODES}, got '{verify_delete}'")
+
+    convert = raw.get("convert", {})
+    verify_convert = convert.get("verify", "probe")
+    if verify_convert not in VERIFY_MODES:
+        raise ConfigError(
+            f"convert.verify must be one of {VERIFY_MODES}, got '{verify_convert}'")
 
     ffmpeg = raw.get("ffmpeg", {})
 
@@ -134,7 +147,8 @@ def load_config(path: Path) -> Config:
         default_profile=default_profile,
         profiles=profiles,
         delete_policy=policy,
-        verify=verify,
+        verify_convert=verify_convert,
+        verify_delete=verify_delete,
         nice=ffmpeg.get("nice"),
         overwrite=ffmpeg.get("overwrite", False),
     )
@@ -254,24 +268,30 @@ def verify_output(src: Path, dst: Path, mode: str) -> tuple[bool, str]:
     return True, f"decode ok ({decoded:.0f}s)"
 
 
-def build_command(src: Path, dst: Path, profile: Profile, cfg: Config) -> list[str]:
+def build_command(src: Path, dst: Path, profile: Profile, cfg: Config,
+                  overwrite: bool | None = None) -> list[str]:
     cmd: list[str] = []
     if cfg.nice is not None:
         cmd += ["nice", "-n", str(cfg.nice)]
     cmd += ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats"]
-    cmd += ["-y" if cfg.overwrite else "-n"]
+    # -n makes ffmpeg decline to clobber an existing output -- and exit 0 while
+    # doing it. Anything that means to re-encode must pass -y, or the encode is a
+    # silent no-op that still looks like success.
+    cmd += ["-y" if (cfg.overwrite if overwrite is None else overwrite) else "-n"]
     cmd += ["-i", str(src)]
     cmd += profile.args
     cmd += [str(dst)]
     return cmd
 
 
-def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config) -> bool:
+def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
+                verify_mode: str, overwrite: bool | None = None) -> bool:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    cmd = build_command(src, dst, profile, cfg)
+    cmd = build_command(src, dst, profile, cfg, overwrite)
     print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
     print(f"  {shlex.join(cmd)}")
 
+    started = time.time()
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
         print(f"  \033[31mffmpeg failed (exit {proc.returncode})\033[0m")
@@ -282,7 +302,14 @@ def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config) -> bool:
             print("  removed partial output")
         return False
 
-    ok, why = verify_output(src, dst, cfg.verify)
+    # Exit 0 is not proof that work happened -- ffmpeg declining to overwrite is
+    # the obvious case, but any no-op would otherwise let us "verify" a stale file
+    # and delete a source for nothing.
+    if not dst.is_file() or dst.stat().st_mtime < started - 1:
+        print("  \033[31mffmpeg exited 0 but did not write the output\033[0m")
+        return False
+
+    ok, why = verify_output(src, dst, verify_mode)
     if not ok:
         print(f"  \033[31mverification failed: {why}\033[0m")
         return False
@@ -305,12 +332,24 @@ def confirm(prompt: str) -> bool:
         return False
 
 
-def maybe_delete(src: Path, dst: Path, cfg: Config, policy: str) -> None:
-    """Delete src, but only ever after its output has been verified."""
+def maybe_delete(src: Path, dst: Path, cfg: Config, policy: str,
+                 already_verified: str = "none") -> None:
+    """Delete src, but only ever after its output has been verified.
+
+    `already_verified` is the mode the post-encode check just passed at. If it is
+    at least as strict as what deletion requires, we trust it rather than decoding
+    the same file a second time.
+    """
     if policy == "never":
         return
 
-    ok, why = verify_output(src, dst, cfg.verify if cfg.verify != "none" else "probe")
+    # Deleting on no evidence at all is indefensible, so "none" floors at "probe".
+    required = cfg.verify_delete if cfg.verify_delete != "none" else "probe"
+
+    if VERIFY_RANK[already_verified] >= VERIFY_RANK[required]:
+        ok, why = True, f"{already_verified} ok"
+    else:
+        ok, why = verify_output(src, dst, required)
     if not ok:
         print(f"  \033[33mkeeping source: {why}\033[0m")
         return
@@ -482,23 +521,36 @@ def cmd_convert(cfg: Config, args: argparse.Namespace) -> int:
             return 0
 
     policy = args.delete or cfg.delete_policy
+    verify_mode = args.verify or cfg.verify_convert
+
+    # If this run will delete sources, the post-encode check has to be at least as
+    # strict as deletion demands -- otherwise maybe_delete would just decode the
+    # file a second time anyway. Escalating here means exactly one decode pass.
+    if policy != "never":
+        required = cfg.verify_delete if cfg.verify_delete != "none" else "probe"
+        if VERIFY_RANK[verify_mode] < VERIFY_RANK[required]:
+            verify_mode = required
+
+    # --redo means "encode this again", which is impossible under -n.
+    overwrite = cfg.overwrite or args.redo
 
     if args.dry_run:
         for f in files:
             dst = output_path_for(f, cfg, profile)
-            print(shlex.join(build_command(f, dst, profile, cfg)))
+            print(shlex.join(build_command(f, dst, profile, cfg, overwrite)))
         print(f"\n{len(files)} file(s), profile '{profile.name}', "
               f"delete policy '{policy}' — dry run, nothing done", file=sys.stderr)
         return 0
 
-    print(f"{len(files)} file(s), profile '{profile.name}', delete policy '{policy}'")
+    print(f"{len(files)} file(s), profile '{profile.name}', "
+          f"delete policy '{policy}', verify '{verify_mode}'")
 
     converted, failed = [], []
     for f in files:
         dst = output_path_for(f, cfg, profile)
-        if convert_one(f, dst, profile, cfg):
+        if convert_one(f, dst, profile, cfg, verify_mode, overwrite):
             converted.append(f)
-            maybe_delete(f, dst, cfg, policy)
+            maybe_delete(f, dst, cfg, policy, already_verified=verify_mode)
         else:
             failed.append(f)
 
@@ -520,12 +572,16 @@ def cmd_clean(cfg: Config, args: argparse.Namespace) -> int:
     if policy == "never":
         policy = "ask"
 
+    mode = args.verify or cfg.verify_delete
+    if mode == "none":
+        mode = "probe"  # never delete on zero evidence
+
     removable, blocked = [], []
     print(f"verifying {len(files)} source(s) against {cfg.output_dir} "
-          f"(mode: {cfg.verify})...")
+          f"(mode: {mode})...")
     for f in files:
         dst = output_path_for(f, cfg, profile)
-        ok, why = verify_output(f, dst, cfg.verify if cfg.verify != "none" else "probe")
+        ok, why = verify_output(f, dst, mode)
         (removable if ok else blocked).append((f, dst, why))
 
     for f, _, why in blocked:
@@ -585,6 +641,11 @@ def main() -> int:
                         help="pick files interactively in a TUI")
     p_conv.add_argument("-d", "--delete", choices=DELETE_POLICIES,
                         help="override delete.policy for this run")
+    p_conv.add_argument("-V", "--verify", choices=VERIFY_MODES,
+                        help="post-encode check (default: convert.verify). "
+                             "'probe' is fast; 'decode' is slow but catches "
+                             "truncation. Escalated automatically if this run "
+                             "deletes sources.")
     p_conv.add_argument("--redo", action="store_true",
                         help="re-convert files whose output already exists")
     p_conv.add_argument("-N", "--dry-run", action="store_true",
@@ -595,6 +656,9 @@ def main() -> int:
     common(p_clean)
     p_clean.add_argument("-d", "--delete", choices=DELETE_POLICIES,
                          help="override delete.policy for this run")
+    p_clean.add_argument("-V", "--verify", choices=VERIFY_MODES,
+                         help="check required before deleting a source "
+                              "(default: delete.verify)")
     p_clean.add_argument("-N", "--dry-run", action="store_true",
                          help="report what would be deleted and exit")
     p_clean.set_defaults(func=cmd_clean)

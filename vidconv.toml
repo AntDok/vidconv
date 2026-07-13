@@ -39,6 +39,20 @@ nice = 10
 # true  => -y (overwrite). `convert --redo` is usually what you want instead.
 overwrite = false
 
+[convert]
+# Check run after each encode. This is the one that costs you wall-clock time.
+#   "probe"  - ffprobe reads the output and its duration matches the source.
+#              Near-instant. The default.
+#   "decode" - fully decode the output. Slow: adds roughly the decode time of
+#              the file to every conversion.
+#   "none"   - trust ffmpeg's exit code and move on. Fastest.
+# Override per-run with `convert --verify none`.
+#
+# If a run deletes sources, this is automatically escalated to whatever
+# delete.verify demands -- there is no way to delete a source without the
+# stricter check having run. It runs exactly once, not twice.
+verify = "probe"
+
 [delete]
 # What to do with a source file after its output verifies.
 #   "ask"   - prompt before deleting (default)
@@ -47,13 +61,14 @@ overwrite = false
 # Override per-run with `convert --delete auto`.
 policy = "ask"
 
-# How hard to check an output before allowing its source to be deleted.
+# How hard to check an output before allowing its source to be DELETED. This is
+# the safety-critical one; it is not about speed.
 #   "decode" - full decode of the output; catches truncation and corruption.
-#              Costs roughly the decode time of the file. This is the only mode
-#              that would have caught the failures the old remove.sh ignored.
-#   "probe"  - ffprobe reads it and the duration matches the source. Fast.
-#   "none"   - no check on convert. `clean` still falls back to "probe",
-#              because deleting on no evidence at all is how you lose files.
+#              The only mode that catches the failures the old remove.sh ignored.
+#   "probe"  - ffprobe reads it and the duration matches the source. Fast, and
+#              blind to a truncated file that still claims full duration.
+#   "none"   - floors at "probe" anyway. Deleting on no evidence at all is how
+#              you lose files, so this setting cannot fully disable the check.
 verify = "decode"
 
 

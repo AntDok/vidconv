@@ -14,6 +14,7 @@ Single file, Python stdlib only, no install step. Needs Python 3.11+ (for
 ./vidconv convert --dry-run     # print the ffmpeg commands, do nothing
 ./vidconv convert -p nvenc      # use a different encode profile
 ./vidconv convert -m 'Season 2' # only paths matching a regex
+./vidconv convert --verify none # skip the post-encode check (fastest)
 ./vidconv convert --redo        # re-convert even if the output exists
 ./vidconv clean                 # delete sources whose outputs verify
 ./vidconv profiles              # list configured profiles
@@ -27,6 +28,26 @@ with `--config`.
 In the TUI: `space` toggle, `a` all, `n` none, `i` invert, `p` cycle profile,
 `enter` run, `q` cancel.
 
+## Verification (and speed)
+
+There are two separate checks, because they have different jobs:
+
+- **`[convert] verify`** — runs after each encode. This is the one that costs you
+  wall-clock time. Default `probe` (near-instant). Set `decode` to fully decode
+  every output, or `none` to skip it. Override per run: `convert --verify none`.
+- **`[delete] verify`** — the check required before a source is *deleted*. Default
+  `decode`. This one is about safety, not speed.
+
+If a run deletes sources, the post-encode check is automatically escalated to
+whatever deletion demands — so `--verify none --delete auto` still decodes. There
+is no way to delete a source without the strict check having run, and it runs
+exactly once, never twice.
+
+**Want conversions fast?** Leave `[convert] verify = "probe"` and use
+`delete.policy = "never"`, then run `vidconv clean` later when you don't care how
+long it takes. That's the intended workflow: cheap during the encode, thorough
+before anything is destroyed.
+
 ## Deleting originals
 
 `delete.policy` in the config controls this, and `--delete` overrides it per run:
@@ -35,9 +56,9 @@ In the TUI: `space` toggle, `a` all, `n` none, `i` invert, `p` cycle profile,
 - `auto` — delete without prompting
 - `never` — keep sources; run `vidconv clean` later
 
-**A source is only ever deleted after its output verifies.** `delete.verify`
-picks how strict that is; `decode` (the default) fully decodes the output and
-compares how far the decode actually got against the source duration.
+**A source is only ever deleted after its output verifies** at `delete.verify`
+strictness. `decode` (the default) fully decodes the output and compares how far
+the decode actually got against the source duration.
 
 That last part matters more than it sounds. Matroska stores duration in the
 segment header, so a file truncated by a crash or a full disk still *claims* its
