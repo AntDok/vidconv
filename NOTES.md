@@ -82,6 +82,41 @@ escalates the post-encode check up to the deletion requirement. Net effect:
 `--verify none --delete auto` still decodes. That escalation is the invariant to
 preserve if you touch this.
 
+## source_dir must never equal output_dir — the failure is not the obvious one
+
+If the two directories are the same, `output_path_for()` hands back the source's
+own path for any file whose extension already matches the profile. You'd expect
+the damage to come from ffmpeg encoding a file onto itself. It doesn't — ffmpeg
+catches that:
+
+```
+Output vid.mkv same as Input #0 - exiting
+```
+
+and exits **non-zero**, leaving the file untouched. The damage came from *us*. A
+non-zero exit means "failed encode", and the failure path deletes the partial
+output so it can't masquerade as a finished file later. But when `dst == src`, the
+"partial output" is the source. **ffmpeg protected the file and vidconv deleted
+it** — reproduced, one real file gone, on the shipped code.
+
+Three guards now, all worth keeping, because each covers what the others miss:
+
+1. `load_config` rejects `source_dir == output_dir` outright (exit 2). Both paths
+   go through `resolve()` first, so `./lib` vs `./lib/../lib` vs a symlink to it
+   are all caught.
+2. `convert_one` refuses to run when `is_same_file(src, dst)`, and — separately —
+   its failure cleanup won't `unlink()` a `dst` that is the source. Config-level
+   checks reason about *directories*; this reasons about the actual file, which is
+   what `unlink()` acts on. Hardlinks and symlinks compare unequal as paths.
+3. `maybe_delete` refuses too. It's the single chokepoint for every deletion
+   (`convert --delete` and `clean` both), and `verify_output()` would otherwise
+   compare the file to itself, pass trivially, and delete the source.
+
+The general lesson, which outlives this particular bug: **cleanup paths delete
+things, so they need the same paranoia as the delete command itself.** The
+verification work all sat in `maybe_delete` while `convert_one`'s error handler
+quietly had an `unlink()` in it with no checks at all.
+
 ## ffmpeg exit 0 does not mean it did anything
 
 `--redo` used to be a **silent no-op that reported success**. With `-n` (the
@@ -118,9 +153,15 @@ Two fixes, keep both:
 
 - **Output paths are derived, not tracked.** `output_path_for()` maps source →
   output deterministically, so there's no state file / database to corrupt or get
-  out of sync. "Already converted?" is just `dst.exists()`. This is why `strip_dirs`
-  exists: dropping the `unconverted` component reproduces the old script's `../`
-  behaviour while keeping the mapping pure.
+  out of sync. "Already converted?" is just `dst.exists()`. The source tree is
+  mirrored into `output_dir`, and that's the whole mapping.
+- **No `strip_dirs`.** There used to be a setting that dropped named components
+  (`unconverted`) from the output path. It was a straight port of the old script,
+  which had no output directory and faked one by writing to `../` — hence its need
+  to find `unconverted/` in the first place. Once both ends of the mapping are
+  stated in the config it earns nothing, and the in-place workflow it enabled
+  requires `source_dir == output_dir`, which is now forbidden outright (below).
+  Don't reintroduce it without reading that section.
 - **`-n` not `-y` by default.** Re-running is safe and idempotent; it skips
   finished work rather than redoing it. `--redo` is the explicit override.
 - **Deletion is a separate concern from conversion.** `convert --delete` and the
@@ -141,6 +182,10 @@ with spaces, and exercise the real binary. Worth redoing after changes:
 - sabotage outputs three ways (**truncate**, empty, delete) → `clean --dry-run`
   must refuse all three
 - `--delete auto` → sources gone, outputs intact
+- `source_dir == output_dir`, and spelled as `./lib` vs `./lib/../lib` vs a symlink
+  → all must exit 2 with the source still on disk
+- `output_dir` nested inside `source_dir` → converts once, and the second run must
+  find nothing new (i.e. it did not rescan its own outputs as sources)
 - bogus encoder in a profile → exit 1, no partial file, source preserved
 - exit codes: 0 ok / 1 failure / 2 config error
 - TUI: drive it through a `pty.fork()` and feed keys, since a curses crash only

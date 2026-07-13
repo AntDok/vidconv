@@ -48,7 +48,6 @@ class Profile:
 class Config:
     source_dir: Path
     output_dir: Path
-    strip_dirs: list[str]
     flatten: bool
     include: list[str]
     exclude: list[str]
@@ -99,6 +98,20 @@ def load_config(path: Path) -> Config:
     if "source_dir" not in paths or "output_dir" not in paths:
         raise ConfigError("[paths] must define both source_dir and output_dir")
 
+    source_dir = resolve(paths["source_dir"])
+    output_dir = resolve(paths["output_dir"])
+
+    # With one directory for both, output_path_for() can hand back the source's own
+    # path. ffmpeg refuses that ("Output same as Input") and exits non-zero -- and
+    # the failure path then deletes what it thinks is a partial output, which is the
+    # source. That destroyed a file during testing. resolve() above collapses
+    # symlinks and ".." first, so this catches the aliased spellings too.
+    if source_dir == output_dir:
+        raise ConfigError(
+            f"source_dir and output_dir must be different directories "
+            f"(both resolve to {source_dir}); a converted file would land on top of "
+            f"its own source")
+
     profiles: dict[str, Profile] = {}
     for name, body in raw.get("profiles", {}).items():
         if "args" not in body:
@@ -137,9 +150,8 @@ def load_config(path: Path) -> Config:
     ffmpeg = raw.get("ffmpeg", {})
 
     return Config(
-        source_dir=resolve(paths["source_dir"]),
-        output_dir=resolve(paths["output_dir"]),
-        strip_dirs=paths.get("strip_dirs", []),
+        source_dir=source_dir,
+        output_dir=output_dir,
         flatten=paths.get("flatten", False),
         include=scan.get("include", ["*.mkv"]),
         exclude=scan.get("exclude", []),
@@ -154,12 +166,19 @@ def load_config(path: Path) -> Config:
     )
 
 
+def is_same_file(a: Path, b: Path) -> bool:
+    """True if a and b are the same file on disk, path spelling aside."""
+    if a == b:
+        return True
+    try:
+        return a.samefile(b)
+    except OSError:  # b does not exist yet, which is the normal case
+        return False
+
+
 def output_path_for(src: Path, cfg: Config, profile: Profile) -> Path:
     rel = src.relative_to(cfg.source_dir)
-    if cfg.flatten:
-        parts: tuple[str, ...] = ()
-    else:
-        parts = tuple(p for p in rel.parts[:-1] if p not in cfg.strip_dirs)
+    parts: tuple[str, ...] = () if cfg.flatten else rel.parts[:-1]
     stem = rel.stem + profile.suffix
     return cfg.output_dir.joinpath(*parts, stem + profile.extension)
 
@@ -168,9 +187,18 @@ def scan(cfg: Config) -> list[Path]:
     if not cfg.source_dir.is_dir():
         raise ConfigError(f"source_dir does not exist: {cfg.source_dir}")
 
+    # output_dir = source_dir/converted is a layout people reach for, and it is safe
+    # -- but the outputs match the include globs, so the next run would scan them as
+    # sources and re-encode its own work forever. Skip the output tree instead of
+    # rejecting the layout.
+    nested_output = (cfg.output_dir.is_relative_to(cfg.source_dir)
+                     and cfg.output_dir != cfg.source_dir)
+
     found: list[Path] = []
     for path in sorted(cfg.source_dir.rglob("*")):
         if not path.is_file():
+            continue
+        if nested_output and path.is_relative_to(cfg.output_dir):
             continue
         rel = path.relative_to(cfg.source_dir)
         if len(rel.parts) < cfg.min_depth:
@@ -286,6 +314,15 @@ def build_command(src: Path, dst: Path, profile: Profile, cfg: Config,
 
 def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
                 verify_mode: str, overwrite: bool | None = None) -> bool:
+    # load_config already rules out source_dir == output_dir, but this is the check
+    # that actually matters: everything below assumes dst is disposable, and the
+    # failure path unlinks it. If dst were src we would delete the source. samefile()
+    # also catches hardlinks and symlinks that compare unequal as paths.
+    if is_same_file(src, dst):
+        print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
+        print("  \033[31mrefusing: the output path is the source file itself\033[0m")
+        return False
+
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_command(src, dst, profile, cfg, overwrite)
     print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
@@ -297,7 +334,7 @@ def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
         print(f"  \033[31mffmpeg failed (exit {proc.returncode})\033[0m")
         # A partial file is worse than none: it looks like a valid output to the
         # next run and to `clean`.
-        if dst.is_file():
+        if dst.is_file() and not is_same_file(src, dst):
             dst.unlink()
             print("  removed partial output")
         return False
@@ -341,6 +378,13 @@ def maybe_delete(src: Path, dst: Path, cfg: Config, policy: str,
     the same file a second time.
     """
     if policy == "never":
+        return
+
+    # Every deletion in the tool funnels through here, so this is the place to be
+    # sure the "output" we are about to trust is not the source wearing a different
+    # path. verify_output() would happily compare the file to itself and pass.
+    if is_same_file(src, dst):
+        print(f"  \033[33mkeeping source: its output path is the source itself\033[0m")
         return
 
     # Deleting on no evidence at all is indefensible, so "none" floors at "probe".

@@ -48,6 +48,16 @@ exactly once, never twice.
 long it takes. That's the intended workflow: cheap during the encode, thorough
 before anything is destroyed.
 
+## source_dir and output_dir
+
+They must be different directories; `vidconv` exits 2 if they aren't. An output
+landing on its own source is the one thing this tool cannot undo — see NOTES.md,
+it destroyed a file during testing before the check existed.
+
+`output_dir` *inside* `source_dir` (say `./media` and `./media/converted`) is fine
+and supported: the scan skips the output tree, so finished files are never picked
+up as fresh sources.
+
 ## Deleting originals
 
 `delete.policy` in the config controls this, and `--delete` overrides it per run:
@@ -76,5 +86,11 @@ direct replacement and refuses to delete anything it cannot verify.
 
 `convert.sh` re-ran its inner `ls *mkv` loop once per file `find` returned, so a
 directory with N files was walked N times. ffmpeg's `-n` made that harmless but
-wasteful. Output paths now come from `strip_dirs` in the config, which reproduces
-the old `../` behaviour by dropping the `unconverted` component from the path.
+wasteful.
+
+The old scripts had no output directory — they inferred one by writing to `../`
+from each `unconverted/` directory, which is why they had to search for that
+directory name at all. With `source_dir` and `output_dir` both stated outright,
+none of that is needed: the source tree is simply mirrored into `output_dir`.
+(An earlier version of `vidconv` carried this over as a `strip_dirs` setting.
+It's gone; delete it from your config if you still have it.)

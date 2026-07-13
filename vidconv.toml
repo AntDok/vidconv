@@ -7,18 +7,22 @@
 default_profile = "x265"
 
 [paths]
-# Where to look for files to convert.
+# Where to look for files to convert. The tree below it is mirrored into
+# output_dir: source_dir/Show/Season 1/ep.mkv -> output_dir/Show/Season 1/ep.mkv
 source_dir = "./convert"
 
-# Where converted files land.
+# Where converted files land. MUST NOT be the same directory as source_dir --
+# vidconv refuses to start if it is. An output landing on top of its own source
+# is unrecoverable, and it is not a hypothetical: ffmpeg declines to encode a file
+# onto itself, which looks like a failed conversion, and the cleanup for a failed
+# conversion deletes the output -- which would be the source.
+#
+# output_dir INSIDE source_dir (e.g. "./convert/converted") is allowed; the scan
+# skips the output tree so finished files are not picked up as new sources.
 output_dir = "./converted"
 
-# Path components to drop when mirroring the source tree into output_dir.
-# With source_dir/Show/Season 1/unconverted/ep.mkv this writes
-# output_dir/Show/Season 1/ep.mkv -- i.e. what the old convert.sh did with "../".
-strip_dirs = ["unconverted"]
-
 # Set true to dump every output directly in output_dir with no subdirectories.
+# Sources with the same filename in different directories will collide.
 flatten = false
 
 [scan]
@@ -35,8 +39,13 @@ min_depth = 0
 # Passed to nice(1). Omit or set to 0 for normal priority.
 nice = 10
 
-# false => -n (never clobber an existing output; safe to re-run).
-# true  => -y (overwrite). `convert --redo` is usually what you want instead.
+# Whether ffmpeg may clobber an EXISTING FILE IN output_dir. It never touches the
+# source: this is ffmpeg's -y/-n, which applies only to the output.
+#   false => -n. An already-converted output is left alone, so re-running vidconv
+#            skips finished work instead of redoing it. The default, and the reason
+#            the tool is safe to re-run.
+#   true  => -y. Re-encode over existing outputs every time.
+# `convert --redo` is the per-run override and is usually what you want.
 overwrite = false
 
 [convert]
