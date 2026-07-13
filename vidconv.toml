@@ -1,8 +1,13 @@
 # vidconv configuration
 #
-# Looked up in this order: ./vidconv.toml, the dir holding the vidconv script,
-# then $XDG_CONFIG_HOME/vidconv/config.toml. Override with --config.
-# Relative paths below resolve against the directory holding THIS file.
+# Looked up in this order: ./vidconv.toml (the directory you run from), then the
+# dir holding the vidconv script, then $XDG_CONFIG_HOME/vidconv/config.toml.
+# Override with --config. Relative paths below resolve against the directory
+# holding THIS file, not the current directory.
+#
+# This copy is checked into git, so it stays a generic example. Keep real paths --
+# which tend to carry hostnames, shares and usernames -- in a vidconv.toml in the
+# directory you run from, or in one you point at with --config.
 
 default_profile = "x265"
 
@@ -17,8 +22,18 @@ source_dir = "./convert"
 # onto itself, which looks like a failed conversion, and the cleanup for a failed
 # conversion deletes the output -- which would be the source.
 #
-# output_dir INSIDE source_dir (e.g. "./convert/converted") is allowed; the scan
-# skips the output tree so finished files are not picked up as new sources.
+# Either directory may sit inside the other:
+#
+#   source_dir = ".../holding/unconverted"   # what the old convert.sh did with ../
+#   output_dir = ".../holding"
+#     Files sit directly in unconverted/, so each maps to holding/<name>.mkv.
+#     Safe as-is: only source_dir is scanned, so the converted files already in
+#     the parent are never re-ingested as new sources.
+#
+#   source_dir = ".../media"
+#   output_dir = ".../media/converted"
+#     Also fine -- the scan skips the output tree, so vidconv will not pick up its
+#     own outputs as fresh sources on the next run.
 output_dir = "./converted"
 
 # Set true to dump every output directly in output_dir with no subdirectories.

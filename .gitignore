@@ -12,8 +12,5 @@ __pycache__/
 *.m4v
 *.ts
 
-# Local config overrides
-vidconv.local.toml
-
 # Local agent instructions, not project code
 CLAUDE.md

@@ -16,7 +16,6 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 import tomllib
 from pathlib import Path
 
@@ -176,6 +175,21 @@ def load_config(path: Path) -> Config:
         nice=ffmpeg.get("nice"),
         overwrite_outputs=ffmpeg.get("overwrite_outputs", False),
     )
+
+
+def file_identity(path: Path) -> tuple[int, int] | None:
+    """(size, mtime_ns) for path, or None if it isn't there.
+
+    Only ever compared against another snapshot of the same file, so it says
+    "this changed" without needing a trustworthy clock. Size is in the tuple
+    because a coarse-grained filesystem can hand back an unchanged mtime for a
+    rewrite that lands inside the same timestamp tick.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
 
 
 def is_same_file(a: Path, b: Path) -> bool:
@@ -341,7 +355,7 @@ def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
     print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
     print(f"  {shlex.join(cmd)}")
 
-    started = time.time()
+    before = file_identity(dst)
     proc = subprocess.run(cmd)
     if proc.returncode != 0:
         print(f"  \033[31mffmpeg failed (exit {proc.returncode})\033[0m")
@@ -355,7 +369,13 @@ def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
     # Exit 0 is not proof that work happened -- ffmpeg declining to overwrite is
     # the obvious case, but any no-op would otherwise let us "verify" a stale file
     # and delete a source for nothing.
-    if not dst.is_file() or dst.stat().st_mtime < started - 1:
+    #
+    # Compare dst against its OWN state from before the run, never against the wall
+    # clock. On a network share (SMB/NFS) mtime comes from the server's clock while
+    # time.time() is ours, and a NAS whose clock drifts a couple of seconds would
+    # otherwise make every successful conversion look like a no-op.
+    after = file_identity(dst)
+    if after is None or after == before:
         print("  \033[31mffmpeg exited 0 but did not write the output\033[0m")
         return False
 

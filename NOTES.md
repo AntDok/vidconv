@@ -135,6 +135,34 @@ Two fixes, keep both:
    "already handles it" — that fix covers the one case we found, this covers the
    ones we didn't.
 
+## Never compare a file's mtime to the wall clock
+
+The "did ffmpeg actually write anything" guard was originally:
+
+```python
+started = time.time()
+...
+if not dst.is_file() or dst.stat().st_mtime < started - 1:   # WRONG
+```
+
+That works on a local disk and breaks on a network share, which is where this
+tool is actually pointed (an SMB mount via gvfs). `st_mtime` comes from the
+**server's** clock; `time.time()` is **ours**. They are not the same clock:
+
+- server running slow → every successful conversion looks like a no-op, so the
+  tool fails everything;
+- server running fast → a stale output looks freshly written, so the no-op guard
+  stops guarding. Verified: with an mtime a day in the future, the old code
+  reported a `-n` no-op as a successful conversion.
+
+`file_identity()` snapshots `(size, mtime_ns)` before the run and compares the
+file to **its own prior state**. No clock is consulted, so skew is irrelevant.
+Size is in the tuple because a coarse-grained filesystem can return an unchanged
+mtime for a rewrite landing inside one timestamp tick.
+
+The general rule, worth applying anywhere else this comes up: **compare a file
+against itself, never against your idea of what time it is.**
+
 ## Other gotchas hit during testing
 
 - **curses crashes on the bottom-right cell.** Writing a character to the last

@@ -25,10 +25,12 @@ If you are about to relax one, read NOTES.md first.
 import contextlib
 import importlib.util
 import io
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -188,6 +190,23 @@ class Units(Base):
         self.assertTrue(vc.is_same_file(real, dotdot))
         # The common case: dst does not exist yet. Must not raise.
         self.assertFalse(vc.is_same_file(real, self.out / "a.mkv"))
+
+    def test_file_identity_detects_a_rewrite_without_consulting_the_clock(self):
+        self.src.mkdir(parents=True)
+        f = self.src / "a.bin"
+        self.assertIsNone(vc.file_identity(f))
+
+        f.write_bytes(b"one")
+        first = vc.file_identity(f)
+        self.assertEqual(vc.file_identity(f), first, "unchanged file looked changed")
+
+        f.write_bytes(b"two different")
+        self.assertNotEqual(vc.file_identity(f), first)
+
+        # Same length, so only the timestamp can give it away -- hence mtime_ns
+        # rather than mtime, which a fast rewrite can land inside a single tick of.
+        f.write_bytes(b"two_different")
+        self.assertNotEqual(vc.file_identity(f), first)
 
     def test_verify_rank_is_ordered_weakest_to_strongest(self):
         self.assertLess(vc.VERIFY_RANK["none"], vc.VERIFY_RANK["probe"])
@@ -359,6 +378,35 @@ class Safety(Base):
                       "deleting run did not escalate to the decode check")
         self.assertFalse((self.src / "a.mkv").exists())
         self.assertDecodesTo(self.out / "a.mkv", 3.0)
+
+    def test_no_op_is_caught_even_when_the_output_mtime_is_in_the_future(self):
+        # The no-op guard used to compare dst's mtime against time.time(). On an SMB
+        # or NFS share the mtime comes from the SERVER's clock while time.time() is
+        # ours, so a NAS running fast would let a stale output pass as freshly
+        # written, and a NAS running slow would fail every good conversion. The guard
+        # now compares dst against its own prior state, so no clock is involved. A
+        # future mtime is the cheap way to simulate a server clock running ahead.
+        #
+        # convert_one is called directly because `convert` skips files whose output
+        # already exists, so it would never reach the guard. -n with an existing dst
+        # is exactly the no-op this protects against: ffmpeg declines to clobber,
+        # prints "already exists", and exits 0.
+        src = self.video("a.mkv")
+        cfg = vc.load_config(self.config())
+        dst = self.out / "a.mkv"
+        dst.parent.mkdir(parents=True)
+        shutil.copy(src, dst)  # a valid, intact, but STALE output
+        future = time.time() + 86400
+        os.utime(dst, (future, future))
+        stale = vc.file_identity(dst)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ok = vc.convert_one(src, dst, cfg.profiles["copy"], cfg, "probe",
+                                overwrite=False)
+
+        self.assertEqual(vc.file_identity(dst), stale, "test bug: dst was rewritten")
+        self.assertFalse(ok, "a no-op encode was reported as a successful conversion")
+        self.assertIn("did not write the output", out.getvalue())
 
     def test_redo_actually_re_encodes(self):
         # --redo was a silent no-op: under -n ffmpeg declines to clobber the
