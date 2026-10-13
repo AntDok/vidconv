@@ -135,6 +135,51 @@ Two fixes, keep both:
    "already handles it" — that fix covers the one case we found, this covers the
    ones we didn't.
 
+## ffmpeg 8 progress: why vidconv renders its own
+
+Surfaced by an Ubuntu upgrade (ffmpeg 6.1 → 8.0): on a file with a mapped
+attachment stream, ffmpeg 8's own stats line reads
+
+```
+frame=34619 fps=108 ... time=N/A bitrate=N/A speed=N/A elapsed=0:05:20
+```
+
+`time=`, and therefore the `bitrate=` and `speed=` derived from it, go **N/A**.
+`frame=`, `fps=`, `elapsed=` still work. The trigger is a mapped **attachment
+stream** — commonly a font carried alongside soft subtitles — which the x265
+profile's `-map 0` pulls in as an output stream. Attachments carry no timestamps,
+and ffmpeg 8's rewritten progress clock takes the minimum timestamp across output
+streams, so one timestamp-less stream drags the whole reading to N/A. ffmpeg
+6.1's older code didn't, which is why the upgrade "broke" it. It's an upstream
+regression, and no package upgrade is available to us anyway (project rule: no
+installs).
+
+**The obvious fix is wrong.** `-map -0:t` drops the attachment and the readout
+comes back — but a subtitle font shipped as an attachment is then lost and the
+subtitles render in a fallback font. The attachment must survive. `-progress
+pipe:1` is poisoned too (its `out_time` is N/A as well), so parsing ffmpeg's own
+timestamp is out.
+
+What does survive, through both the stats line and `-progress`, is `frame=`. So
+`run_with_progress()` leaves the ffmpeg command alone (fonts untouched), passes
+`-nostats -progress pipe:1`, and derives percent / rate / ETA itself from the
+frame count against the source's total frames (`duration × avg_frame_rate` via
+ffprobe — `nb_frames` is usually absent from the container header). This is both
+a fix and an upgrade: the old stats never showed a percent or an ETA.
+
+Things that are load-bearing here:
+
+- **`-map 0` stays.** The fix is in how we *read* progress, never in what we mux.
+  The `test_converts_a_file_with_a_font_attachment_and_keeps_the_font` test guards
+  against someone "fixing" the N/A by dropping attachments.
+- **Snap to 100% on `progress=end`.** The last `frame=` sample lands just before
+  the end marker, so without it the final reading sticks at ~98%.
+- **tty vs not.** On a tty we redraw one line with `\r` every 0.5s and wipe it
+  before the `ok` summary; piped to a log we emit a newline-terminated sample
+  every 30s instead, so a `nohup`/cron run doesn't write a megabyte of `\r`.
+- **Frame total can be unknown** (true VFR, or an unreadable source): fall back to
+  a `frame N / fps / elapsed` line rather than inventing a percent.
+
 ## Never compare a file's mtime to the wall clock
 
 The "did ffmpeg actually write anything" guard was originally:

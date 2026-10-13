@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -263,6 +264,99 @@ def probe_duration(path: Path) -> float | None:
         return None
 
 
+def video_fps(path: Path) -> float | None:
+    """Average frame rate of the first video stream, in fps, or None."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=avg_frame_rate",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    val = proc.stdout.strip()
+    num, sep, den = val.partition("/")
+    try:
+        if sep:
+            n, d = float(num), float(den)
+            return n / d if d else None
+        return float(val) or None
+    except ValueError:
+        return None
+
+
+def _fmt_hms(seconds: float) -> str:
+    seconds = max(int(seconds), 0)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def run_with_progress(cmd: list[str], total_frames: int | None,
+                      duration: float | None) -> int:
+    """Run ffmpeg, rendering our own progress, and return its exit code.
+
+    ffmpeg 8's own time=/bitrate=/speed= stats read N/A the moment an attachment
+    stream (a subtitle font, in practice) is mapped into the output: attachments
+    carry no timestamps and poison ffmpeg's progress clock. frame= still comes
+    through -progress, so we derive percent/rate/ETA from the frame count against
+    the source's known frame total instead. See NOTES.md ("ffmpeg 8 progress").
+
+    Falls back to a frame/elapsed line when the source's duration or frame rate
+    can't be determined (e.g. genuinely variable frame rate).
+    """
+    tty = sys.stderr.isatty()
+    start = time.monotonic()
+    last_draw = 0.0
+    frame = 0
+    clear_width = 0
+    drew = False
+
+    def draw() -> None:
+        nonlocal clear_width, drew
+        elapsed = time.monotonic() - start
+        if total_frames and duration and frame > 0:
+            pct = min(frame / total_frames, 1.0)
+            media = pct * duration
+            speed = media / elapsed if elapsed > 0 else 0.0
+            eta = (duration - media) / speed if speed > 0 else 0.0
+            msg = (f"  {pct * 100:4.0f}%  {speed:5.1f}x  "
+                   f"elapsed {_fmt_hms(elapsed)}  ETA {_fmt_hms(eta)}")
+        else:
+            wall_fps = frame / elapsed if elapsed > 0 else 0.0
+            msg = f"  frame {frame}  {wall_fps:.0f} fps  elapsed {_fmt_hms(elapsed)}"
+        if tty:
+            msg = msg[: shutil.get_terminal_size((80, 24)).columns - 1]
+            sys.stderr.write("\r" + msg + " " * max(clear_width - len(msg), 0))
+            clear_width = len(msg)
+        else:
+            sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+        drew = True
+
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            key, _, value = line.strip().partition("=")
+            if key == "frame" and value.isdigit():
+                frame = int(value)
+            elif key == "progress":
+                now = time.monotonic()
+                if value == "end":
+                    # The last frame= sample lands just before end; snap to the
+                    # total so the final reading is 100%, not a stray 98%.
+                    if total_frames:
+                        frame = total_frames
+                    draw()
+                elif now - last_draw >= (0.5 if tty else 30.0):
+                    last_draw = now
+                    draw()
+    # Wipe the in-place line so the "ok ..." summary starts on a clean row. On a
+    # non-tty the samples were newline-terminated log lines, so leave them be.
+    if drew and tty:
+        sys.stderr.write("\r" + " " * clear_width + "\r")
+        sys.stderr.flush()
+    return proc.returncode
+
+
 def decode_duration(path: Path) -> tuple[float | None, str]:
     """Fully decode path and report how far the decode actually got.
 
@@ -327,7 +421,11 @@ def build_command(src: Path, dst: Path, profile: Profile, cfg: Config,
     cmd: list[str] = []
     if cfg.nice is not None:
         cmd += ["nice", "-n", str(cfg.nice)]
-    cmd += ["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats"]
+    # -nostats silences ffmpeg's own progress line (its time=/speed= read N/A on any
+    # file with a mapped attachment under ffmpeg 8); -progress pipe:1 feeds machine-
+    # readable progress to stdout, which run_with_progress turns into our own line.
+    cmd += ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats",
+            "-progress", "pipe:1"]
     # -n makes ffmpeg decline to clobber an existing output -- and exit 0 while
     # doing it. Anything that means to re-encode must pass -y, or the encode is a
     # silent no-op that still looks like success.
@@ -355,10 +453,16 @@ def convert_one(src: Path, dst: Path, profile: Profile, cfg: Config,
     print(f"\n\033[1m→ {src.relative_to(cfg.source_dir)}\033[0m")
     print(f"  {shlex.join(cmd)}")
 
+    # Frame total for the progress readout: ffprobe gives duration and frame rate
+    # even when the per-frame timestamps ffmpeg relies on are unavailable.
+    duration = probe_duration(src)
+    fps = video_fps(src)
+    total_frames = round(duration * fps) if duration and fps else None
+
     before = file_identity(dst)
-    proc = subprocess.run(cmd)
-    if proc.returncode != 0:
-        print(f"  \033[31mffmpeg failed (exit {proc.returncode})\033[0m")
+    returncode = run_with_progress(cmd, total_frames, duration)
+    if returncode != 0:
+        print(f"  \033[31mffmpeg failed (exit {returncode})\033[0m")
         # A partial file is worse than none: it looks like a valid output to the
         # next run and to `clean`.
         if dst.is_file() and not is_same_file(src, dst):

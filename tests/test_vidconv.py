@@ -125,6 +125,26 @@ class Base(unittest.TestCase):
         shutil.copy(self._fixture, dst)
         return dst
 
+    def video_with_attachment(self, relpath: str) -> Path:
+        """A video + audio + soft subtitle + TTF font attachment -- the stream
+        layout that makes ffmpeg 8's own progress stats read N/A."""
+        dst = self.src / relpath
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        ass = self.tmp / "s.ass"
+        ass.write_text(
+            "[Script Info]\nScriptType: v4.00+\n[Events]\n"
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+            "Dialogue: 0,0:00:00.00,0:00:03.00,Default,,0,0,0,,hi\n")
+        font = self.tmp / "fake.ttf"
+        font.write_bytes(b"\x00\x01\x00\x00" + b"x" * 2044)  # enough to embed
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-y", "-i", str(self._fixture), "-i", str(ass),
+             "-map", "0:v", "-map", "0:a", "-map", "1", "-c:v", "copy", "-c:a", "copy",
+             "-c:s", "ass", "-attach", str(font),
+             "-metadata:s:t:0", "mimetype=application/x-truetype-font", str(dst)],
+            check=True, capture_output=True)
+        return dst
+
     def config(self, **kw) -> Path:
         opts = dict(
             profile="copy",
@@ -212,6 +232,17 @@ class Units(Base):
         self.assertLess(vc.VERIFY_RANK["none"], vc.VERIFY_RANK["probe"])
         self.assertLess(vc.VERIFY_RANK["probe"], vc.VERIFY_RANK["decode"])
 
+    def test_fmt_hms(self):
+        self.assertEqual(vc._fmt_hms(0), "0:00")
+        self.assertEqual(vc._fmt_hms(9), "0:09")
+        self.assertEqual(vc._fmt_hms(75), "1:15")
+        self.assertEqual(vc._fmt_hms(3661), "1:01:01")
+        self.assertEqual(vc._fmt_hms(-5), "0:00")  # never show negative ETA
+
+    def test_video_fps_parses_the_rational_rate(self):
+        v = self.video("a.mkv")  # fixture is 10 fps
+        self.assertAlmostEqual(vc.video_fps(v), 10.0, delta=0.01)
+
 
 class ConfigErrors(Base):
     """Bad configs must be rejected, not tolerated."""
@@ -296,8 +327,10 @@ class Convert(Base):
                                config=self.config(overwrite_outputs="false"))
         on = self.run_vidconv("convert", "--dry-run",
                               config=self.config(overwrite_outputs="true"))
-        self.assertIn("-stats -n", off.stdout)
-        self.assertIn("-stats -y", on.stdout)
+        self.assertIn(" -n ", off.stdout)
+        self.assertNotIn(" -y ", off.stdout)
+        self.assertIn(" -y ", on.stdout)
+        self.assertNotIn(" -n ", on.stdout)
 
     def test_nested_output_dir_is_not_rescanned_as_a_source(self):
         # output_dir inside source_dir is a layout people reach for. Outputs match
@@ -308,6 +341,24 @@ class Convert(Base):
         self.run_vidconv("convert", config=cfg)
         proc = self.run_vidconv("list", config=cfg)
         self.assertIn("1 file(s)", proc.stdout)
+
+    def test_converts_a_file_with_a_font_attachment_and_keeps_the_font(self):
+        # ffmpeg 8's own time=/speed= stats read N/A whenever a font attachment is
+        # mapped, which is why vidconv renders progress itself -- but the attachment
+        # MUST survive, or subtitles that depend on that font lose it. The
+        # tempting fix (-map -0:t) would drop it, so guard against that regressing.
+        self.video_with_attachment("show/ep.mkv")
+        proc = self.run_vidconv("convert", "-p", "x265")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        out = self.out / "show" / "ep.mkv"
+        kinds = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(out)],
+            capture_output=True, text=True).stdout.split()
+        self.assertIn("attachment", kinds, "the font attachment was dropped")
+        self.assertIn("subtitle", kinds)
+        self.assertIn("video", kinds)
 
     def test_failed_encode_leaves_no_partial_output(self):
         # A corpse in output_dir looks like finished work to the next run and to

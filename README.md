@@ -28,6 +28,19 @@ with `--config`.
 In the TUI: `space` toggle, `a` all, `n` none, `i` invert, `p` cycle profile,
 `enter` run, `q` cancel.
 
+## Progress display
+
+During an encode vidconv prints a live line with percent, rate, elapsed and ETA:
+
+```
+  42%   4.1x  elapsed 3:14  ETA 11:22
+```
+
+It computes this itself from ffmpeg's frame count rather than using ffmpeg's own
+`time=`/`speed=` stats, which read `N/A` on ffmpeg 8 for some inputs. When piped
+to a file it writes a plain sample every 30s instead of redrawing in place. See
+NOTES.md for the details.
+
 ## Tests
 
 ```sh
